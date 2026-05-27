@@ -136,6 +136,8 @@ function normalizeLedgerEntry(entry, previousHash = 'GENESIS') {
 }
 
 export const TrustProtocol = {
+    sha256HexSync,
+
     /** @enum {string} */
     RANKS: {
         BRONZE: 'Bronze',

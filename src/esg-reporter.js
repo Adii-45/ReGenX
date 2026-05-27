@@ -2,23 +2,81 @@
  * @fileoverview ReGenX Enterprise ESG Reporting Engine
  * Generates high-fidelity HTML-to-PDF reports for Corporate Social Responsibility metrics.
  * Phase 2 Upgrade: Optimized ESG coefficient algorithms and modular reporting formats.
+ * Phase 2.1: Runtime hardening — Promise leak guards, defensive hash serialization.
  * @author GSSoC Contributor
  */
 
+import { TrustProtocol } from './trust.js';
+
+/** Placeholder returned when hash computation fails in a rendering context. */
+const HASH_UNAVAILABLE = '0x_HASH_UNAVAILABLE';
+
 export const ESGReporter = {
+    // ──────────────────────────────────────────────
+    //  Internal Type Guards & Defensive Utilities
+    // ──────────────────────────────────────────────
+
+    /**
+     * Detects Promise-like values (thenables) to prevent Promise leakage into
+     * synchronous rendering pipelines.
+     * @param {*} value - Value to inspect.
+     * @returns {boolean} `true` if the value looks like a Promise/thenable.
+     */
+    _isPromiseLike: (value) =>
+        value != null && typeof (value.then ?? value.catch) === 'function',
+
+    /**
+     * Normalizes a hash value to a safe string for use in UI templates.
+     * Prevents `.slice()`, `.substring()`, or string-concatenation crashes
+     * if the value is a Promise, null, undefined, or a non-string type.
+     * @param {*} value - Expected hash string.
+     * @param {string} [fallback] - Fallback when the value is unusable.
+     * @returns {string} Guaranteed string hash value.
+     */
+    _ensureStringHash: (value, fallback = HASH_UNAVAILABLE) => {
+        if (typeof value === 'string' && value.length > 0) return value;
+        if (ESGReporter._isPromiseLike(value)) {
+            console.warn('[ESG] Promise leaked into sync rendering pipeline — using fallback hash.');
+            return fallback;
+        }
+        if (value == null) return fallback;
+        // Coerce unexpected primitives (number, boolean) to string safely
+        try { return String(value) || fallback; } catch { return fallback; }
+    },
     /**
      * Canonicalize a value for hashing so object key order cannot affect the digest.
+     * Handles circular references safely via a seen-set guard.
      * @param {*} value - Value to serialize.
+     * @param {WeakSet} [_seen] - Internal cycle-detection set (do not pass externally).
      * @returns {string} Stable string representation.
      */
-    canonicalizeHashPayload: (value) => {
+    canonicalizeHashPayload: (value, _seen) => {
         if (value === null) return 'null';
         if (value === undefined) return 'undefined';
-        if (Array.isArray(value)) return `[${value.map(ESGReporter.canonicalizeHashPayload).join(',')}]`;
-        if (typeof value === 'object') {
-            return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${ESGReporter.canonicalizeHashPayload(value[key])}`).join(',')}}`;
+
+        // Primitives — no cycle risk
+        if (typeof value !== 'object') return JSON.stringify(value);
+
+        // Reject Promises that leaked into the payload
+        if (ESGReporter._isPromiseLike(value)) {
+            console.warn('[ESG] Promise object detected in hash payload — serializing as null.');
+            return 'null';
         }
-        return JSON.stringify(value);
+
+        // Circular reference guard
+        const seen = _seen || new WeakSet();
+        if (seen.has(value)) {
+            console.warn('[ESG] Circular reference detected in hash payload — serializing as null.');
+            return 'null';
+        }
+        seen.add(value);
+
+        if (Array.isArray(value)) {
+            return `[${value.map(v => ESGReporter.canonicalizeHashPayload(v, seen)).join(',')}]`;
+        }
+        return `{${Object.keys(value).sort().map(key =>
+            `${JSON.stringify(key)}:${ESGReporter.canonicalizeHashPayload(value[key], seen)}`
+        ).join(',')}}`;
     },
 
     /**
@@ -41,6 +99,24 @@ export const ESGReporter = {
      * @returns {Promise<string>} Hex-encoded hash with 0x prefix.
      */
     generateAuditHash: async (payload) => ESGReporter.computeSecureHash(payload),
+
+    /**
+     * Synchronous hash generation using pure-JS SHA-256 implementation.
+     * Safe to call from template literals — never throws. Returns a
+     * deterministic fallback placeholder on any serialization or hashing error.
+     * @param {Object} [payload] - Report payload to hash.
+     * @returns {string} Hex-encoded hash with 0x prefix, or HASH_UNAVAILABLE on failure.
+     */
+    generateAuditHashSync: (payload) => {
+        try {
+            const serialized = ESGReporter.canonicalizeHashPayload(payload);
+            const hash = TrustProtocol.sha256HexSync(serialized);
+            return ESGReporter._ensureStringHash(hash);
+        } catch (err) {
+            console.warn('[ESG] generateAuditHashSync failed — using fallback.', err?.message || err);
+            return HASH_UNAVAILABLE;
+        }
+    },
 
     /**
      * Loads the public audit registry from localStorage.
@@ -93,7 +169,7 @@ export const ESGReporter = {
             : 0;
 
         const dateStr = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-        const reportHash = ESGReporter.generateAuditHash();
+        const reportHash = ESGReporter._ensureStringHash(ESGReporter.generateAuditHashSync());
 
         let qualityBadgeColor = 'badge-red';
         let qualityText = 'Needs Improvement';
@@ -190,7 +266,7 @@ export const ESGReporter = {
                         </div>
                         <div style="flex:1; overflow-y:auto; max-height:480px; padding-right:4px;">
                             ${history.length ? history.map(o => {
-                                const orderHash = o.txHash || ESGReporter.generateAuditHash().slice(0, 18) + '...';
+                                const orderHash = ESGReporter._ensureStringHash(o.txHash || ESGReporter.generateAuditHashSync()).slice(0, 18) + '...';
                                 const score = parseFloat(o.segScore) || (o.quality === 'Good (Segregated)' ? 85 : 45);
                                 return `
                                     <div style="background:var(--surface-hover); border:1px solid var(--border); border-radius:12px; padding:12px; margin-bottom:12px;">
@@ -288,7 +364,7 @@ export const ESGReporter = {
                                 <div style="margin-top:36px; text-align:center; font-size:9px; color:#94A3B8; border-top:1px dashed #E2E8F0; padding-top:16px; position:relative;">
                                     <div class="esg-preview-watermark">VERIFIED</div>
                                     <p style="margin:0 0 4px 0;">This ESG record is digitally verified on the ReGenX smart registry ledger network.</p>
-                                    <p style="font-family:monospace; background:#F1F5F9; display:inline-block; padding:3px 6px; border-radius:4px; color:#475569; margin:0;">Signature Hash: ${reportHash.slice(0, 32)}...</p>
+                                    <p style="font-family:monospace; background:#F1F5F9; display:inline-block; padding:3px 6px; border-radius:4px; color:#475569; margin:0;">Signature Hash: ${ESGReporter._ensureStringHash(reportHash).slice(0, 32)}...</p>
                                 </div>
                             </div>
                         </div>
@@ -404,10 +480,10 @@ export const ESGReporter = {
         try {
             reportHash = await ESGReporter.generateAuditHash(reportPayload);
         } catch (e) {
-            console.error('Failed to generate audit hash:', e);
-            if (window.showToast) window.showToast('⚠️ Failed to generate ESG verification hash.');
-            return;
+            console.warn('[ESG] Async hash failed in generateReport — falling back to sync hash.', e?.message || e);
+            reportHash = ESGReporter.generateAuditHashSync(reportPayload);
         }
+        reportHash = ESGReporter._ensureStringHash(reportHash);
         const dateStr = new Date(timestamp).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 
         // Save generated verification record to ReGenX Public Audit registry
@@ -496,7 +572,7 @@ export const ESGReporter = {
                 </thead>
                 <tbody>
                     ${history.length ? history.map(o => {
-                        const h = o.txHash || ESGReporter.generateAuditHash();
+                        const h = ESGReporter._ensureStringHash(o.txHash || ESGReporter.generateAuditHashSync());
                         const s = parseFloat(o.segScore) || (o.quality === 'Good (Segregated)' ? 85 : 45);
                         return `
                             <tr>

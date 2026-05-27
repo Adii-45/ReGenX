@@ -2,9 +2,13 @@
  * @fileoverview ReGenX Appwrite Cloud Sync Engine
  * Handles real-time synchronization between LocalStorage and Appwrite Cloud Databases.
  * Integrates WebSockets for Live Dispatch updates.
- * Phase 2 Upgrade: Implemented robust conflict resolution and offline queue sync hooks.
+ * Phase 3 Upgrade: Integrated timestamp-based conflict resolution via ConflictResolver,
+ * replaced legacy localStorage queue with IndexedDB bridge from offline-sync.js.
  * @author GSSoC Contributor
  */
+
+import { resolveConflict } from './conflict-resolver.js';
+import { queueOfflineAction as idbQueueAction, isDBReady } from './offline-sync.js';
 
 const STORAGE_KEY_PREFIX = "regenx-v3:";
 
@@ -292,6 +296,9 @@ export const CloudSync = {
 
     /**
      * Pushes a local state change to the Appwrite Database.
+     * Performs timestamp-based conflict resolution before overwriting:
+     * if the cloud version is newer, the stale local write is discarded
+     * and local storage is updated with the cloud version instead.
      * @param {string} collection - Target collection ID.
      * @param {Object} payload - Data to sync.
      * @returns {Promise<void>}
@@ -305,6 +312,41 @@ export const CloudSync = {
             const sanitizedDoc = CloudSync.sanitizeDoc(payload);
             const { databaseId, ordersCollectionId } = CloudSync.config;
 
+            // Timestamp-based conflict resolution: fetch cloud version first
+            let cloudDoc = null;
+            try {
+                cloudDoc = await CloudSync.databases.getDocument(
+                    databaseId,
+                    ordersCollectionId,
+                    payload.id
+                );
+            } catch (fetchErr) {
+                // 404 means document does not exist on cloud yet — proceed to create
+                if (fetchErr.code !== 404) {
+                    console.warn('[CloudSync] Failed to fetch cloud doc for conflict check:', fetchErr);
+                }
+            }
+
+            if (cloudDoc) {
+                // Use resolveConflict: build local/server representations
+                const localAction = { id: payload.id, timestamp: payload.ts || 0 };
+                const serverData = { id: cloudDoc.id || cloudDoc.$id, timestamp: cloudDoc.ts || 0 };
+                const resolution = resolveConflict(localAction, serverData);
+
+                if (resolution === null) {
+                    // Cloud is newer or duplicate — discard stale local write, update local cache
+                    console.log(`[CloudSync] Cloud version is newer for ${payload.id} — discarding local overwrite.`);
+                    const localKey = STORAGE_KEY_PREFIX + 'ord:' + payload.id;
+                    try {
+                        localStorage.setItem(localKey, JSON.stringify(cloudDoc));
+                    } catch { /* ignore storage errors */ }
+                    if (window.refreshCurrentView) window.refreshCurrentView(false);
+                    CloudSync.renderSyncBadge('live', 'Cloud Live');
+                    return;
+                }
+            }
+
+            // Local is newer or no cloud version exists — proceed with upsert
             try {
                 await CloudSync.databases.updateDocument(
                     databaseId,
@@ -430,18 +472,43 @@ export const CloudSync = {
     },
 
     /**
-     * Queues a write for offline retry. Stored in localStorage under a dedicated key.
+     * Queues a write for offline retry.
+     * Primary storage: IndexedDB via offline-sync.js.
+     * Fallback: localStorage under a dedicated key if IndexedDB is unavailable.
      * Latest value for any given key wins (deduplication).
      * @param {string} key - Data key (e.g. 'ord:abc123').
      * @param {Object} data - Data payload.
      */
     queueOfflineWrite: (key, data) => {
+        // Determine the action type from the key prefix
+        const type = key.startsWith('ord:') ? 'sync-order' :
+                     key.startsWith('acc:') ? 'sync-account' : 'dispatch';
+
+        // Try IndexedDB first
+        if (isDBReady()) {
+            idbQueueAction(type, data).then(() => {
+                console.log(`[CloudSync] Queued offline write to IndexedDB for key: ${key}`);
+            }).catch((err) => {
+                console.warn('[CloudSync] IndexedDB queue failed, falling back to localStorage:', err);
+                CloudSync._fallbackLocalStorageQueue(key, data);
+            });
+        } else {
+            CloudSync._fallbackLocalStorageQueue(key, data);
+        }
+    },
+
+    /**
+     * Fallback: queue to localStorage if IndexedDB is unavailable.
+     * @param {string} key
+     * @param {Object} data
+     */
+    _fallbackLocalStorageQueue: (key, data) => {
         try {
             const queue = JSON.parse(localStorage.getItem('regenx-offline-queue') || '[]');
             const filtered = queue.filter(item => item.key !== key);
             filtered.push({ key, data, ts: Date.now() });
             localStorage.setItem('regenx-offline-queue', JSON.stringify(filtered));
-            console.log(`[CloudSync] Queued offline write for key: ${key}`);
+            console.log(`[CloudSync] Queued offline write to localStorage for key: ${key}`);
         } catch (e) {
             console.warn('[CloudSync] Failed to queue offline write:', e);
         }
@@ -449,35 +516,40 @@ export const CloudSync = {
 
     /**
      * Flushes all offline-queued writes to Appwrite.
+     * Drains both the IndexedDB queue (via offline-sync.js syncPendingActions)
+     * and any legacy localStorage entries.
      * Called when the app comes back online.
      * @returns {Promise<void>}
      */
     flushOfflineQueue: async () => {
         if (!CloudSync.isLive) return;
+
+        // Flush legacy localStorage queue entries
         try {
             const queue = JSON.parse(localStorage.getItem('regenx-offline-queue') || '[]');
-            if (queue.length === 0) return;
-            console.log(`[CloudSync] Flushing ${queue.length} offline queued writes...`);
-            const failed = [];
-            for (const item of queue) {
-                try {
-                    if (item.key.startsWith('ord:') && item.data?.id) {
-                        await CloudSync.pushDocument(CloudSync.config.ordersCollectionId, item.data);
-                    } else if (item.key.startsWith('acc:') && item.data?.id) {
-                        await CloudSync.pushAccount(item.data);
+            if (queue.length > 0) {
+                console.log(`[CloudSync] Flushing ${queue.length} legacy localStorage queued writes...`);
+                const failed = [];
+                for (const item of queue) {
+                    try {
+                        if (item.key.startsWith('ord:') && item.data?.id) {
+                            await CloudSync.pushDocument(CloudSync.config.ordersCollectionId, item.data);
+                        } else if (item.key.startsWith('acc:') && item.data?.id) {
+                            await CloudSync.pushAccount(item.data);
+                        }
+                    } catch (e) {
+                        failed.push(item);
                     }
-                } catch (e) {
-                    failed.push(item);
+                }
+                localStorage.setItem('regenx-offline-queue', JSON.stringify(failed));
+                if (failed.length === 0) {
+                    window.showToast?.('✅ All offline data synced to cloud!');
+                } else {
+                    console.warn(`[CloudSync] ${failed.length} legacy writes still pending after flush.`);
                 }
             }
-            localStorage.setItem('regenx-offline-queue', JSON.stringify(failed));
-            if (failed.length === 0) {
-                window.showToast?.('✅ All offline data synced to cloud!');
-            } else {
-                console.warn(`[CloudSync] ${failed.length} writes still pending after flush.`);
-            }
         } catch (e) {
-            console.error('[CloudSync] flushOfflineQueue failed:', e);
+            console.error('[CloudSync] flushOfflineQueue (localStorage) failed:', e);
         }
     },
 

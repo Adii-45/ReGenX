@@ -8,6 +8,7 @@ import { ReGenXRealtime } from './realtime-sync.js';
 import { CloudSync } from './cloud-sync.js';
 import { ESGReporter } from './esg-reporter.js';
 import { AccessibilityManager } from './accessibility.js';
+import { initOfflineDB, queueOfflineAction as idbQueueOfflineAction, syncPendingActions as idbSyncPendingActions, setupNetworkListeners as idbSetupNetworkListeners, getPendingCount as idbGetPendingCount } from './offline-sync.js';
 const STORAGE_KEY_PREFIX = "regenx-v3:";
 const TRUST_LEDGER_KEY = STORAGE_KEY_PREFIX + "trust-ledger";
 const ESG_ALERTS_KEY = STORAGE_KEY_PREFIX + "esg-alerts";
@@ -319,6 +320,7 @@ function getUnreadNotificationCount(role) {
 }
 
 function loadOfflineQueue() {
+  // Legacy localStorage queue — kept for backward compat during migration
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY_PREFIX + OFFLINE_QUEUE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
@@ -347,14 +349,28 @@ function updateNotificationBadge() {
 }
 
 function updateOfflineQueueIndicator() {
-  const queueCount = loadOfflineQueue().length;
-  const statusLabel = document.getElementById('notif-sync-status');
-  if (statusLabel) {
-    statusLabel.textContent = queueCount
-      ? `${queueCount} pending sync action${queueCount === 1 ? '' : 's'}`
-      : 'All activity synced';
-    statusLabel.classList.toggle('sync-pending', queueCount > 0);
-  }
+  // Async query to IndexedDB for accurate pending count, with localStorage fallback
+  idbGetPendingCount().then(idbCount => {
+    const legacyCount = loadOfflineQueue().length;
+    const totalCount = idbCount + legacyCount;
+    const statusLabel = document.getElementById('notif-sync-status');
+    if (statusLabel) {
+      statusLabel.textContent = totalCount
+        ? `${totalCount} pending sync action${totalCount === 1 ? '' : 's'}`
+        : 'All activity synced';
+      statusLabel.classList.toggle('sync-pending', totalCount > 0);
+    }
+  }).catch(() => {
+    // Fallback: use legacy localStorage count only
+    const queueCount = loadOfflineQueue().length;
+    const statusLabel = document.getElementById('notif-sync-status');
+    if (statusLabel) {
+      statusLabel.textContent = queueCount
+        ? `${queueCount} pending sync action${queueCount === 1 ? '' : 's'}`
+        : 'All activity synced';
+      statusLabel.classList.toggle('sync-pending', queueCount > 0);
+    }
+  });
 }
 
 function isDuplicateNotification(title, body) {
@@ -477,17 +493,30 @@ window.markAllNotificationsRead = function() {
 
 function queueOfflineAction(action) {
   if (!action || !action.type) return;
-  const queue = loadOfflineQueue();
-  queue.push({ id: uid(), ts: ts(), ...action });
-  saveOfflineQueue(queue);
-  updateOfflineQueueIndicator();
+  // Primary path: IndexedDB via offline-sync.js
+  const type = action.type || 'dispatch';
+  const payload = action.payload || action;
+  idbQueueOfflineAction(type, payload).then(() => {
+    updateOfflineQueueIndicator();
+  }).catch(() => {
+    // Fallback: legacy localStorage queue if IndexedDB fails
+    const queue = loadOfflineQueue();
+    queue.push({ id: uid(), ts: ts(), ...action });
+    saveOfflineQueue(queue);
+    updateOfflineQueueIndicator();
+  });
 }
 
 async function processOfflineAction(action) {
   if (!action || !action.type) return;
   if (action.type === 'sync-order') {
     if (window.CloudSync && window.CloudSync.isLive && navigator.onLine) {
-      window.CloudSync.pushDocument('orders', action.payload);
+      await window.CloudSync.pushDocument(window.CloudSync.config?.ordersCollectionId || 'orders', action.payload);
+    }
+  }
+  if (action.type === 'sync-account') {
+    if (window.CloudSync && window.CloudSync.isLive && navigator.onLine) {
+      await window.CloudSync.pushAccount(action.payload);
     }
   }
   if (action.type === 'sync-notification') {
@@ -496,20 +525,27 @@ async function processOfflineAction(action) {
 }
 
 async function flushOfflineQueue() {
+  // Flush legacy localStorage queue
   const queue = loadOfflineQueue();
-  if (!queue.length) return;
-  for (const action of queue) {
-    await processOfflineAction(action);
+  if (queue.length) {
+    for (const action of queue) {
+      await processOfflineAction(action);
+    }
+    saveOfflineQueue([]);
   }
-  saveOfflineQueue([]);
+  // Flush IndexedDB queue via offline-sync.js
+  await idbSyncPendingActions();
   updateOfflineQueueIndicator();
-  addWorkflowNotification({
-    title: 'Offline Sync Completed',
-    body: `${queue.length} queued action${queue.length === 1 ? '' : 's'} were synced successfully.`,
-    role: SESSION.role || 'all',
-    type: 'sync',
-    priority: 'normal'
-  });
+  const totalFlushed = queue.length;
+  if (totalFlushed > 0) {
+    addWorkflowNotification({
+      title: 'Offline Sync Completed',
+      body: `${totalFlushed} queued action${totalFlushed === 1 ? '' : 's'} were synced successfully.`,
+      role: SESSION.role || 'all',
+      type: 'sync',
+      priority: 'normal'
+    });
+  }
 }
 
 window.syncPendingActions = async function() {
@@ -2335,7 +2371,7 @@ function saveOrder(o) {
   // persist locally and publish to realtime and cloud sync when available
   DB.set('ord:'+o.id, o, { rooms: ['network_room', 'providers_room', 'riders_room', 'plants_room', 'admin_room'], eventType: 'KPI_UPDATED' });
   if (window.CloudSync && window.CloudSync.isLive && navigator.onLine) {
-    window.CloudSync.pushDocument('orders', o);
+    window.CloudSync.pushDocument(window.CloudSync.config?.ordersCollectionId || 'orders', o);
   } else {
     queueOfflineAction({ type: 'sync-order', payload: o });
   }
@@ -5204,6 +5240,20 @@ switchAuthTab('login');
 // ── Initialize Appwrite Cloud Sync Engine ──
 setTimeout(() => { ReGenXRealtime?.init(); ReGenXRealtime?.requestSnapshot?.(); }, 1000);
 setTimeout(() => { if (window.CloudSync) window.CloudSync.init(); }, 1000);
+
+// ── Initialize IndexedDB Offline Sync Engine ──
+initOfflineDB().then(() => {
+  console.log('[App] IndexedDB offline sync engine initialized.');
+  idbSetupNetworkListeners();
+  // Auto-sync if already online at startup
+  if (navigator.onLine) {
+    idbSyncPendingActions().catch(err => {
+      console.warn('[App] Initial IndexedDB sync failed:', err);
+    });
+  }
+}).catch(err => {
+  console.warn('[App] IndexedDB init failed — falling back to localStorage queue:', err);
+});
 
 // Expose module-scoped functions to global scope for inline HTML handlers
 window.doRegister = doRegister;
